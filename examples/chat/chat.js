@@ -23,7 +23,12 @@ const addMsg = (who, text) => {
   $("log").scrollTop = $("log").scrollHeight;
 };
 
-const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+const pc = new RTCPeerConnection({
+  iceServers: [
+    { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
+    { urls: "stun:stun.cloudflare.com:3478" },
+  ],
+});
 window._pc = pc; // keep alive
 const ready = init();
 let role = null, dc = null, chat = null;
@@ -49,16 +54,27 @@ $("send").onclick = () => {
 $("text").addEventListener("keydown", (e) => { if (e.key === "Enter") $("send").click(); });
 $("manualBtn").onclick = () => { location.href = location.pathname + "?manual"; };
 
-// Resolve when ICE gathering completes, but never hang: host candidates arrive
-// in milliseconds (enough for same-machine / LAN); STUN gets a short window for
-// a srflx candidate, then we proceed with whatever is in the local description.
-async function waitIceComplete(maxMs = 2000) {
+// Resolve as soon as we have a routable path — a public (srflx/STUN) candidate,
+// or gathering completion — so it's fast when STUN answers. A generous cap
+// gives a slow STUN a real chance before we fall back to a LAN-only link, but
+// we never hang.
+async function waitIceComplete(capMs = 8000) {
   if (pc.iceGatheringState === "complete") return;
   await new Promise((res) => {
-    const finish = () => { pc.removeEventListener("icegatheringstatechange", check); clearTimeout(timer); res(); };
-    const check = () => { if (pc.iceGatheringState === "complete") finish(); };
-    const timer = setTimeout(finish, maxMs);
-    pc.addEventListener("icegatheringstatechange", check);
+    const done = () => { cleanup(); res(); };
+    const onState = () => { if (pc.iceGatheringState === "complete") done(); };
+    const onCand = (e) => {
+      const c = e.candidate;
+      if (c && (c.type === "srflx" || /typ srflx/.test(c.candidate || ""))) done();
+    };
+    const timer = setTimeout(done, capMs);
+    const cleanup = () => {
+      clearTimeout(timer);
+      pc.removeEventListener("icegatheringstatechange", onState);
+      pc.removeEventListener("icecandidate", onCand);
+    };
+    pc.addEventListener("icegatheringstatechange", onState);
+    pc.addEventListener("icecandidate", onCand);
   });
 }
 
