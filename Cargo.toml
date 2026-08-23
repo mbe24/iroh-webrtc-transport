@@ -1,0 +1,65 @@
+[package]
+name = "iroh-webrtc-transport"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Carry iroh's QUIC over a WebRTC data channel — a droppable iroh custom transport that makes a browser a first-class peer (browser↔browser, no data relay)."
+repository = "https://github.com/mbe24/iroh-webrtc-transport"
+keywords = ["iroh", "webrtc", "p2p", "quic", "wasm"]
+categories = ["network-programming", "wasm"]
+
+# The `lib` is native + wasm; `cdylib` is what wasm-bindgen consumes for the
+# browser build.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# The datagram abstraction + iroh adapter are always available. Backends are
+# opt-in so a consumer implementing its own backend need not pull webrtc-rs.
+default = ["webrtc-native"]
+# Native WebRTC backend (webrtc-rs). The in-memory backend is always available
+# on native (tiny, tokio-only); the browser backend is always on for wasm32.
+webrtc-native = ["dep:webrtc", "dep:anyhow"]
+
+[dependencies]
+# Shared across native and wasm: iroh's QUIC + the custom-transport seam.
+iroh = { version = "1", default-features = false, features = ["tls-ring", "unstable-custom-transports"] }
+iroh-base = "1"          # CustomAddr / EndpointId (not re-exported by `iroh`)
+noq-udp = "1.1"          # RecvMeta / BATCH_SIZE named by poll_recv (both targets)
+n0-watcher = "1"         # watch_local_addrs return type
+bytes = "1"
+
+# Native-only: the in-memory + webrtc-rs backends use tokio channels/runtime.
+[target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
+tokio = { version = "1", features = ["sync", "rt", "macros"] }
+# webrtc 0.17 is the classic callback API (0.20+ is a sans-io rewrite with a
+# different, poll-based surface — do not bump without rewriting webrtc_native).
+# Optional: pulled only by the `webrtc-native` feature.
+webrtc = { version = "0.17", optional = true }
+anyhow = { version = "1", optional = true }
+
+# Browser-only: web-sys WebRTC data channel + wasm async + a Send/Sync shim for
+# JS handles (iroh's custom-transport traits are unconditionally Send+Sync;
+# browser WebRTC handles are !Send, so we wrap them — sound: wasm is single-threaded).
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+# Pinned so the wasm-bindgen CLI that generates the JS glue matches exactly.
+wasm-bindgen = "=0.2.127"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+futures = "0.3"
+send_wrapper = "0.6"
+
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies.web-sys]
+version = "0.3"
+# Only the data-channel surface — signaling (RTCPeerConnection etc.) lives in JS.
+features = ["MessageEvent", "RtcDataChannel", "RtcDataChannelType"]
+
+# Tests (native only) exercise the in-memory/webrtc backends with a raw-byte
+# round-trip — no application coupling, so the crate stays standalone.
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+# The native WebRTC round-trip needs the backend; skipped under --no-default-features.
+[[test]]
+name = "webrtc"
+required-features = ["webrtc-native"]

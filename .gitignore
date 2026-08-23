@@ -1,0 +1,7 @@
+/target
+node_modules/
+package-lock.json
+Cargo.lock
+
+# The built wasm bundle (examples/chat/pkg) IS committed so the demo runs with
+# no toolchain — clone, `npm start`, open two tabs. Regenerate with `npm run build`.
