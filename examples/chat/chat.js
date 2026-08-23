@@ -166,6 +166,15 @@ function renderQR(text) {
 }
 
 // ---------- Mode B: manual link / QR (cross-device, no server) ----------
+// A "public" (srflx) candidate is what lets a peer on another network reach us.
+// If STUN didn't answer within the cap, we only have host candidates → the link
+// works on the same machine / LAN but not across the internet. Say so.
+const hasPublicCandidate = () => /typ srflx/.test(pc.localDescription.sdp || "");
+const lanOnlyWarning = () =>
+  hasPublicCandidate()
+    ? ""
+    : `<p style="color:#b26a00">⚠ LAN-only: no public (STUN) candidate was gathered in time, so this link will only connect on the same machine or local network — not across the internet. Reload to retry.</p>`;
+
 async function manualSignaling() {
   $("manual").hidden = false;
   pc.onicecandidate = () => {}; // non-trickle: candidates ride in the (compacted) SDP
@@ -174,19 +183,22 @@ async function manualSignaling() {
     becomeAnswerer();
     await pc.setRemoteDescription(unpackSdp(decodeURIComponent(offerParam)));
     await pc.setLocalDescription(await pc.createAnswer());
+    setStatus("gathering network path…");
     await waitIceComplete();
     const link = linkFor("#answer=" + encodeURIComponent(packSdp(pc.localDescription)));
-    setStatus("answer ready — send it back to the offerer");
-    $("manual-body").innerHTML = `<p>Send this <b>answer</b> back (scan or copy):</p><div class="link">${link}</div>`;
+    setStatus(hasPublicCandidate() ? "answer ready — send it back to the offerer" : "answer ready (LAN-only)");
+    $("manual-body").innerHTML =
+      `${lanOnlyWarning()}<p>Send this <b>answer</b> back (scan or copy):</p><div class="link">${link}</div>`;
     renderQR(link);
   } else {
     await becomeOfferer();
     await pc.setLocalDescription(await pc.createOffer());
+    setStatus("gathering network path…");
     await waitIceComplete();
     const link = linkFor("#offer=" + encodeURIComponent(packSdp(pc.localDescription)));
-    setStatus("offer ready — share it, then paste the answer");
+    setStatus(hasPublicCandidate() ? "offer ready — share it, then paste the answer" : "offer ready (LAN-only)");
     $("manual-body").innerHTML =
-      `<p>Share this <b>offer</b> with your peer (scan or copy):</p><div class="link">${link}</div>
+      `${lanOnlyWarning()}<p>Share this <b>offer</b> with your peer (scan or copy):</p><div class="link">${link}</div>
        <p>Paste the <b>answer</b> they send back:</p>
        <textarea id="ans" placeholder="paste the #answer=… link"></textarea>
        <button id="applyAns">connect</button>`;
