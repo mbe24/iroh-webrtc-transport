@@ -1,8 +1,8 @@
-// Browser↔browser chat over iroh's QUIC on a WebRTC data channel.
+// Browser-to-browser chat over iroh's QUIC on a WebRTC data channel.
 //
 // Signaling is 100% serverless (works on static hosting like GitHub Pages):
 //   • same-browser tabs auto-pair over BroadcastChannel (default);
-//   • across devices, exchange an offer/answer link (?manual).
+//   • across devices, exchange a compact offer/answer (link or QR, ?manual).
 // The transport is iroh: JS opens the RTCDataChannel, then hands it to the wasm
 // `start_chat`, which runs iroh's QUIC + a bi-stream over it. Data never touches
 // a server.
@@ -23,7 +23,6 @@ const addMsg = (who, text) => {
   $("log").scrollTop = $("log").scrollHeight;
 };
 
-// STUN helps across-NAT; harmless on localhost/LAN (host candidates win).
 const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
 window._pc = pc; // keep alive
 const ready = init();
@@ -40,29 +39,30 @@ async function startTransport() {
   enableChat();
 }
 function wireChannel(channel) { dc = channel; dc.onopen = () => startTransport(); }
+async function becomeOfferer() { role = "offerer"; wireChannel(pc.createDataChannel("iroh", { ordered: false, maxRetransmits: 0 })); }
+function becomeAnswerer() { role = "answerer"; pc.ondatachannel = (e) => wireChannel(e.channel); }
 
 $("send").onclick = () => {
   const t = $("text").value.trim();
   if (t && chat) { chat.send(t); addMsg("me", t); $("text").value = ""; }
 };
 $("text").addEventListener("keydown", (e) => { if (e.key === "Enter") $("send").click(); });
-
-// role: "offerer" creates the data channel; "answerer" receives it.
-async function becomeOfferer() { role = "offerer"; wireChannel(pc.createDataChannel("iroh", { ordered: false, maxRetransmits: 0 })); }
-function becomeAnswerer() { role = "answerer"; pc.ondatachannel = (e) => wireChannel(e.channel); }
+$("manualBtn").onclick = () => { location.href = location.pathname + "?manual"; };
 
 async function waitIceComplete() {
   if (pc.iceGatheringState === "complete") return;
   await new Promise((res) => pc.addEventListener("icegatheringstatechange", () => pc.iceGatheringState === "complete" && res()));
 }
 
+pc.onconnectionstatechange = () => addMsg("sys", "peer connection: " + pc.connectionState);
+
 // ---------- Mode A: BroadcastChannel (same-browser tabs) ----------
-// RTCSessionDescription / RTCIceCandidate are platform objects that are NOT
-// structured-cloneable, so BroadcastChannel.postMessage would throw on them.
-// Send plain JSON-able objects instead.
+// RTCSessionDescription / RTCIceCandidate aren't structured-cloneable, so send
+// plain JSON-able objects over BroadcastChannel.
 const sdpPlain = (d) => ({ type: d.type, sdp: d.sdp });
 
 async function broadcastSignaling() {
+  $("manualBtn").hidden = false;
   const myId = Math.random().toString(36).slice(2);
   const bc = new BroadcastChannel("iroh-webrtc:" + room);
   let peerId = null;
@@ -70,10 +70,10 @@ async function broadcastSignaling() {
   bc.onmessage = async (ev) => {
     const m = ev.data;
     if (m.t === "hello") {
-      if (peerId !== null) return;          // already paired
+      if (peerId !== null) return;
       peerId = m.id;
-      bc.postMessage({ t: "hello", id: myId }); // let the peer learn us too
-      if (myId > peerId) {                  // deterministic role election
+      bc.postMessage({ t: "hello", id: myId });
+      if (myId > peerId) {
         await becomeOfferer();
         await pc.setLocalDescription(await pc.createOffer());
         bc.postMessage({ t: "sdp", sdp: sdpPlain(pc.localDescription) });
@@ -95,44 +95,101 @@ async function broadcastSignaling() {
   addMsg("sys", "open this exact URL in a second tab to connect");
 }
 
-// ---------- Mode B: manual link exchange (cross-device, no server) ----------
-const enc = (o) => btoa(JSON.stringify(o));
-const dec = (s) => JSON.parse(atob(s));
-function showManual(html) { $("manual").open = true; $("manual-body").innerHTML = html; }
-function linkFor(hash) { return location.origin + location.pathname + hash; }
+// ---------- SDP compaction (the ~crypto-floor link) ----------
+// A data-channel SDP is 95% boilerplate; only ufrag/pwd/fingerprint/setup and
+// the candidates vary. We ship just those (fingerprint as raw bytes) and rebuild
+// a valid SDP on the other side — ~150 chars instead of multi-KB.
+const b64u = (bytes) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const unb64u = (s) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
+const fpToB64 = (hex) => b64u(hex.split(":").map((h) => parseInt(h, 16)));
+const b64ToFp = (b) => [...unb64u(b)].map((x) => x.toString(16).padStart(2, "0").toUpperCase()).join(":");
 
+function packSdp(desc) {
+  const s = desc.sdp;
+  const g = (re) => (s.match(re) || [])[1] || "";
+  const cands = [...s.matchAll(/a=candidate:\S+ \d+ udp \d+ (\S+) (\d+) typ (\S+)(?: raddr (\S+) rport (\d+))?/gi)]
+    .map((m) => (m[3] === "host" ? `${m[1]},${m[2]}` : `${m[1]},${m[2]},${m[3][0]},${m[4]},${m[5]}`));
+  const setup = g(/a=setup:(\S+)/);
+  return [
+    desc.type === "offer" ? "o" : "a",
+    setup === "actpass" ? "A" : setup === "active" ? "a" : "p",
+    g(/a=ice-ufrag:(\S+)/),
+    g(/a=ice-pwd:(\S+)/),
+    fpToB64(g(/a=fingerprint:sha-256 ([0-9A-Fa-f:]+)/i)),
+    cands.join(";"),
+  ].join("~");
+}
+
+function unpackSdp(packed) {
+  const [t, su, ufrag, pwd, fpb, candStr] = packed.split("~");
+  const setup = su === "A" ? "actpass" : su === "a" ? "active" : "passive";
+  const expand = (c) => ({ h: "host", s: "srflx", r: "relay" }[c] || "host");
+  const cands = candStr
+    ? candStr.split(";").map((c, i) => {
+        const p = c.split(",");
+        return p.length === 2
+          ? `a=candidate:${i} 1 udp ${2122252543 - i} ${p[0]} ${p[1]} typ host`
+          : `a=candidate:${i} 1 udp ${1686052607 - i} ${p[0]} ${p[1]} typ ${expand(p[2])} raddr ${p[3]} rport ${p[4]}`;
+      })
+    : [];
+  const lines = [
+    "v=0", "o=- 0 0 IN IP4 0.0.0.0", "s=-", "t=0 0",
+    "a=group:BUNDLE 0", "a=msid-semantic: WMS",
+    "m=application 9 UDP/DTLS/SCTP webrtc-datachannel", "c=IN IP4 0.0.0.0",
+    `a=ice-ufrag:${ufrag}`, `a=ice-pwd:${pwd}`,
+    `a=fingerprint:sha-256 ${b64ToFp(fpb)}`, `a=setup:${setup}`, "a=mid:0",
+    "a=sctp-port:5000", "a=max-message-size:262144", ...cands,
+  ];
+  return { type: t === "o" ? "offer" : "answer", sdp: lines.join("\r\n") + "\r\n" };
+}
+
+function linkFor(hash) { return location.origin + location.pathname + hash; }
+function renderQR(text) {
+  const el = $("qr");
+  el.innerHTML = "";
+  try {
+    const qr = window.qrcode(0, "L"); // auto version, low EC (max capacity)
+    qr.addData(text);
+    qr.make();
+    el.innerHTML = `<img alt="QR" src="${qr.createDataURL(5, 2)}" />`;
+  } catch (e) {
+    el.textContent = "(QR unavailable: " + e.message + ")";
+  }
+}
+
+// ---------- Mode B: manual link / QR (cross-device, no server) ----------
 async function manualSignaling() {
-  pc.onicecandidate = () => {}; // non-trickle: candidates ride in the SDP after gathering
+  $("manual").hidden = false;
+  pc.onicecandidate = () => {}; // non-trickle: candidates ride in the (compacted) SDP
   const offerParam = new URLSearchParams(location.hash.slice(1)).get("offer");
   if (offerParam) {
     becomeAnswerer();
-    await pc.setRemoteDescription(dec(offerParam));
+    await pc.setRemoteDescription(unpackSdp(decodeURIComponent(offerParam)));
     await pc.setLocalDescription(await pc.createAnswer());
     await waitIceComplete();
-    const link = linkFor("#answer=" + enc(pc.localDescription));
-    setStatus("answer ready — send the link back to the offerer");
-    showManual(`<p>Send this <b>answer link</b> back to whoever gave you the offer:</p>
-      <textarea readonly onclick="this.select()">${link}</textarea>`);
+    const link = linkFor("#answer=" + encodeURIComponent(packSdp(pc.localDescription)));
+    setStatus("answer ready — send it back to the offerer");
+    $("manual-body").innerHTML = `<p>Send this <b>answer</b> back (scan or copy):</p><div class="link">${link}</div>`;
+    renderQR(link);
   } else {
     await becomeOfferer();
     await pc.setLocalDescription(await pc.createOffer());
     await waitIceComplete();
-    const link = linkFor("#offer=" + enc(pc.localDescription));
-    setStatus("offer ready — share the link, then paste the answer");
-    showManual(`<p>Share this <b>offer link</b> with your peer:</p>
-      <textarea readonly onclick="this.select()">${link}</textarea>
-      <p>Paste the <b>answer link</b> they send back:</p>
-      <textarea id="ans" placeholder="paste #answer=… link here"></textarea>
-      <button id="applyAns">connect</button>`);
+    const link = linkFor("#offer=" + encodeURIComponent(packSdp(pc.localDescription)));
+    setStatus("offer ready — share it, then paste the answer");
+    $("manual-body").innerHTML =
+      `<p>Share this <b>offer</b> with your peer (scan or copy):</p><div class="link">${link}</div>
+       <p>Paste the <b>answer</b> they send back:</p>
+       <textarea id="ans" placeholder="paste the #answer=… link"></textarea>
+       <button id="applyAns">connect</button>`;
+    renderQR(link);
     $("applyAns").onclick = async () => {
       const v = $("ans").value.trim();
       const a = new URLSearchParams(v.slice(v.indexOf("#") + 1)).get("answer");
-      if (a) { await pc.setRemoteDescription(dec(a)); setStatus("answer applied — connecting…"); }
+      if (a) { await pc.setRemoteDescription(unpackSdp(decodeURIComponent(a))); setStatus("answer applied — connecting…"); }
     };
   }
 }
-
-pc.onconnectionstatechange = () => addMsg("sys", "peer connection: " + pc.connectionState);
 
 ready.then(() => {
   setStatus(isManual ? "manual mode" : "ready");

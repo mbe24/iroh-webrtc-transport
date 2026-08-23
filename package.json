@@ -2,7 +2,7 @@
   "name": "iroh-webrtc-transport-chat",
   "private": true,
   "type": "module",
-  "description": "Browser↔browser chat demo for the iroh-webrtc-transport crate. Serverless signaling; iroh QUIC over a WebRTC data channel.",
+  "description": "Browser-to-browser chat demo for the iroh-webrtc-transport crate. Serverless signaling; iroh QUIC over a WebRTC data channel.",
   "scripts": {
     "build": "wasm-pack build --target web --no-default-features --out-dir examples/chat/pkg",
     "start": "node examples/chat/serve.mjs",

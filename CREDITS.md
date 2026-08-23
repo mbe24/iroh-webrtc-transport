@@ -26,6 +26,9 @@ the mechanics. Thank you.
 - **[webrtc-rs](https://github.com/webrtc-rs/webrtc)** — MIT OR Apache-2.0.
   The native backend's loopback data-channel setup follows the crate's own
   `data-channels` examples.
+- **[qrcode-generator](https://github.com/kazuhikoarase/qrcode-generator)** by
+  Kazuhiko Arase — MIT. Vendored at `examples/chat/vendor/qrcode.js` to render
+  the manual-mode offer/answer QR codes.
 
 ## MIT acknowledgement (SuddenlyHazel/iroh-webrtc-transport)
 
