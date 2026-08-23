@@ -49,9 +49,17 @@ $("send").onclick = () => {
 $("text").addEventListener("keydown", (e) => { if (e.key === "Enter") $("send").click(); });
 $("manualBtn").onclick = () => { location.href = location.pathname + "?manual"; };
 
-async function waitIceComplete() {
+// Resolve when ICE gathering completes, but never hang: host candidates arrive
+// in milliseconds (enough for same-machine / LAN); STUN gets a short window for
+// a srflx candidate, then we proceed with whatever is in the local description.
+async function waitIceComplete(maxMs = 2000) {
   if (pc.iceGatheringState === "complete") return;
-  await new Promise((res) => pc.addEventListener("icegatheringstatechange", () => pc.iceGatheringState === "complete" && res()));
+  await new Promise((res) => {
+    const finish = () => { pc.removeEventListener("icegatheringstatechange", check); clearTimeout(timer); res(); };
+    const check = () => { if (pc.iceGatheringState === "complete") finish(); };
+    const timer = setTimeout(finish, maxMs);
+    pc.addEventListener("icegatheringstatechange", check);
+  });
 }
 
 pc.onconnectionstatechange = () => addMsg("sys", "peer connection: " + pc.connectionState);
