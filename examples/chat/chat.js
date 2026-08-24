@@ -23,15 +23,96 @@ const addMsg = (who, text) => {
   $("log").scrollTop = $("log").scrollHeight;
 };
 
-const pc = new RTCPeerConnection({
-  iceServers: [
-    { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
-    { urls: "stun:stun.cloudflare.com:3478" },
-  ],
-});
-window._pc = pc; // keep alive
+// The connection is created AFTER we've probed/ranked STUN servers (see
+// resolveIceServers + bootstrap below), so its iceServers are the healthiest for
+// this network right now.
+let pc = null;
 const ready = init();
 let role = null, dc = null, chat = null;
+
+// ---------- STUN probing: pool → probe on load → rank by latency → cache --------
+// Each probe is ONE STUN Binding Request (a single tiny UDP round-trip — the same
+// thing every WebRTC connection does; Google's public Trickle ICE tester works
+// exactly this way, so it's standard, not abuse). We probe the pool in parallel on
+// load, keep the reachable servers ranked fastest-first, and cache the ranking in
+// sessionStorage with a short TTL: reloads and ?manual reuse it instantly, while a
+// new tab / browser restart / >5-min-old cache re-probes (catching network changes).
+const STUN_POOL = [
+  "stun:stun.l.google.com:19302", // Google
+  "stun:stun1.l.google.com:19302",
+  "stun:stun2.l.google.com:19302",
+  "stun:stun3.l.google.com:19302",
+  "stun:stun4.l.google.com:19302",
+  "stun:stun.cloudflare.com:3478", // Cloudflare
+  "stun:global.stun.twilio.com:3478", // Twilio
+  "stun:stun.relay.metered.ca:80", // Metered
+  "stun:stun.nextcloud.com:443", // Nextcloud
+  "stun:stun.sipgate.net:3478", // sipgate
+  "stun:stun.sipgate.net:10000",
+  "stun:stun.services.mozilla.com", // Mozilla (may be retired; the probe confirms)
+];
+const PROBE_TIMEOUT_MS = 2500;
+const TOP_N = 4; // healthiest servers to actually use
+const CACHE_KEY = "iroh-webrtc:stun-rank";
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+// Probe one server: resolve {url, ok, ms} where ms is time-to-first-srflx (a
+// public candidate proves the server answered), or unreachable after the timeout.
+function probeStun(url) {
+  return new Promise((resolve) => {
+    let p;
+    try { p = new RTCPeerConnection({ iceServers: [{ urls: url }] }); }
+    catch { return resolve({ url, ok: false, ms: Infinity }); }
+    const t0 = performance.now();
+    let settled = false;
+    let timer;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { p.onicecandidate = null; p.close(); } catch {}
+      resolve({ url, ok, ms: ok ? performance.now() - t0 : Infinity });
+    };
+    timer = setTimeout(() => finish(false), PROBE_TIMEOUT_MS);
+    p.onicecandidate = (e) => {
+      const c = e.candidate;
+      if (c && (c.type === "srflx" || /typ srflx/.test(c.candidate || ""))) finish(true);
+    };
+    try {
+      p.createDataChannel("probe"); // a media section so gathering starts
+      p.createOffer().then((o) => p.setLocalDescription(o)).catch(() => finish(false));
+    } catch { finish(false); }
+  });
+}
+
+function readStunCache() {
+  try {
+    const c = JSON.parse(sessionStorage.getItem(CACHE_KEY) || "null");
+    if (c && c.ts && Array.isArray(c.ranked) && c.ranked.length && Date.now() - c.ts <= CACHE_TTL_MS) return c;
+  } catch {}
+  return null;
+}
+
+// Resolve iceServers for the real connection: a fresh cached ranking, or a live
+// probe → rank reachable servers fastest-first → cache → take the top N. Falls
+// back to the whole pool (likely LAN-only) if nothing answered.
+async function resolveIceServers() {
+  let cache = readStunCache();
+  if (!cache) {
+    setStatus("probing STUN servers…");
+    const results = await Promise.all(STUN_POOL.map(probeStun));
+    const ranked = results.filter((r) => r.ok).sort((a, b) => a.ms - b.ms).map((r) => r.url);
+    cache = { ranked, ts: Date.now() };
+    try { sessionStorage.setItem(CACHE_KEY, JSON.stringify(cache)); } catch {}
+  }
+  const top = cache.ranked.slice(0, TOP_N);
+  if (!top.length) {
+    addMsg("sys", "no STUN server responded to the probe — this link may be LAN-only");
+    return STUN_POOL.map((urls) => ({ urls }));
+  }
+  addMsg("sys", `STUN ready: ${top.length} healthy of ${STUN_POOL.length} probed`);
+  return top.map((urls) => ({ urls }));
+}
 
 function enableChat() {
   $("text").disabled = false; $("send").disabled = false; $("text").focus();
@@ -77,8 +158,6 @@ async function waitIceComplete(capMs = 8000) {
     pc.addEventListener("icecandidate", onCand);
   });
 }
-
-pc.onconnectionstatechange = () => addMsg("sys", "peer connection: " + pc.connectionState);
 
 // ---------- Mode A: BroadcastChannel (same-browser tabs) ----------
 // RTCSessionDescription / RTCIceCandidate aren't structured-cloneable, so send
@@ -227,7 +306,15 @@ async function manualSignaling() {
   }
 }
 
-ready.then(() => {
+// Bootstrap: probe/rank STUN → create the connection with the healthiest servers
+// → wait for wasm → start signaling.
+async function bootstrap() {
+  const iceServers = await resolveIceServers();
+  pc = new RTCPeerConnection({ iceServers });
+  window._pc = pc; // keep alive
+  pc.onconnectionstatechange = () => addMsg("sys", "peer connection: " + pc.connectionState);
+  await ready;
   setStatus(isManual ? "manual mode" : "ready");
   (isManual ? manualSignaling() : broadcastSignaling());
-}).catch((e) => setStatus("wasm load failed: " + e));
+}
+bootstrap().catch((e) => setStatus("startup failed: " + e));
